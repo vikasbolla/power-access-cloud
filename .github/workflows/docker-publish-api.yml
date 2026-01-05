@@ -30,6 +30,8 @@ jobs:
     uses: ./.github/workflows/fetch-go-version.yml
 
   build:
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
     runs-on: ubuntu-latest
     needs: call-fetch-go-version
     permissions:
@@ -74,7 +76,16 @@ jobs:
           context: ./api
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             GO_VERSION=${{ needs.call-fetch-go-version.outputs.go-version }}
+
+  image-scan:
+    needs: build
+    uses: ./.github/workflows/license_scan.yml
+    with:
+      image: ${{ needs.build.outputs.image-tag }}
+      tag: ${{ github.sha }}
+      fail-on-vuln: "true"

@@ -92,3 +92,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
 #            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:{{ env.RELEASE_VERSION }}-${{ env.KEYCLOAK_VERSION }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Scan image (license only)
+        uses: ./license_scan.yml
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/keycloak
+          tag: ${{ github.sha }}
+          fail-on-vuln: "true"

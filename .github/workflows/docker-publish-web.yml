@@ -75,3 +75,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan image (license only)
+        uses: ./license_scan.yml
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/web
+          tag: ${{ github.sha }}
+          fail-on-vuln: "true"
