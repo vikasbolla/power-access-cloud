@@ -1,184 +1,216 @@
 name: CentOS Image Automation
 
 on:
-    schedule:
-        # Run every 15 days at 2:00 AM UTC
-        - cron: "0 2 */15 * *"
-    workflow_dispatch:
-        inputs:
-            centos_version:
-                description: "CentOS Stream version (e.g., 9, 10)"
-                required: false
-                default: "10"
-            target_disk_size:
-                description: "Target disk size in GB"
-                required: false
-                default: "120"
+  schedule:
+    # Run every 15 days at 2:00 AM UTC
+    - cron: "0 2 */15 * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment for image deployment"
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+        default: "staging"
+      centos_version:
+        description: "CentOS Stream version (e.g., 9, 10)"
+        required: false
+        default: "10"
+      image_size:
+        description: "Image disk size in GB"
+        required: false
+        default: "120"
 
 env:
-    WORK_DIR: /tmp/centos-images
+  WORK_DIR: /tmp/centos-images
 
 jobs:
-    centos-image-automation:
-        runs-on: ubuntu-latest
-        timeout-minutes: 240 # 4 hours max
+  centos-image-automation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240 # 4 hours max
+    strategy:
+      matrix:
+        centos_version: [9, 10]
+      fail-fast: false # Continue with other versions even if one fails
 
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-            - name: Set up environment
-              run: |
-                  mkdir -p ${{ env.WORK_DIR }}
-                  sudo apt-get update
-                  sudo apt-get install -y curl wget jq sshpass
+      - name: Set up environment
+        run: |
+          mkdir -p ${{ env.WORK_DIR }}
+          sudo apt-get update
+          sudo apt-get install -y curl wget jq sshpass
 
-            - name: Configure SSH for PowerVM
-              env:
-                  POWERVM_SSH_KEY: ${{ secrets.POWERVM_SSH_KEY }}
-              run: |
-                  mkdir -p ~/.ssh
-                  echo "$POWERVM_SSH_KEY" > ~/.ssh/powervm_key
-                  chmod 600 ~/.ssh/powervm_key
+      - name: Configure SSH for PowerVM
+        env:
+          POWERVM_SSH_KEY: ${{ secrets.POWERVM_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$POWERVM_SSH_KEY" > ~/.ssh/powervm_key
+          chmod 600 ~/.ssh/powervm_key
 
-                  # Add PowerVM to known hosts
-                  ssh-keyscan -H ${{ secrets.POWERVM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Add PowerVM to known hosts
+          ssh-keyscan -H ${{ secrets.POWERVM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
 
-            - name: Install pvsadm locally
-              run: |
-                  PVSADM_VERSION="v0.1.13"
-                  wget -q https://github.com/ppc64le-cloud/pvsadm/releases/download/${PVSADM_VERSION}/pvsadm-linux-amd64.tar.gz
-                  tar -xzf pvsadm-linux-amd64.tar.gz
-                  sudo mv pvsadm /usr/local/bin/
-                  pvsadm version
+      - name: Install pvsadm locally
+        run: |
+          PVSADM_VERSION="v0.1.13"
+          wget -q https://github.com/ppc64le-cloud/pvsadm/releases/download/${PVSADM_VERSION}/pvsadm-linux-amd64.tar.gz
+          tar -xzf pvsadm-linux-amd64.tar.gz
+          sudo mv pvsadm /usr/local/bin/
+          pvsadm version
 
-            - name: Transfer scripts and template to PowerVM
-              env:
-                  POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
-                  POWERVM_USER: ${{ secrets.POWERVM_USER }}
-              run: |
-                  echo "Transferring files to PowerVM..."
+      - name: Transfer scripts and template to PowerVM
+        env:
+          POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
+          POWERVM_USER: ${{ secrets.POWERVM_USER }}
+        run: |
+          echo "Transferring files to PowerVM..."
 
-                  # Create work directory on PowerVM
-                  ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST} \
-                    "mkdir -p ${{ env.WORK_DIR }}"
+          # Create work directory on PowerVM
+          ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "mkdir -p ${{ env.WORK_DIR }}"
 
-                  # Transfer scripts and template
-                  scp -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    hack/scripts/download-and-convert-centos.sh \
-                    hack/scripts/image-prep.template.static \
-                    ${POWERVM_USER}@${POWERVM_HOST}:${{ env.WORK_DIR }}/
+          # Transfer all scripts and template
+          scp -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
+            hack/scripts/download-and-convert-centos.sh \
+            hack/scripts/upload-to-cos.sh \
+            hack/scripts/import-to-powervs.sh \
+            hack/scripts/image-prep.template.static \
+            ${POWERVM_USER}@${POWERVM_HOST}:${{ env.WORK_DIR }}/
 
-                  # Make script executable
-                  ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST} \
-                    "chmod +x ${{ env.WORK_DIR }}/download-and-convert-centos.sh"
+          # Make scripts executable
+          ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "chmod +x ${{ env.WORK_DIR }}/*.sh"
 
-            - name: Download and convert CentOS image on PowerVM
-              env:
-                  POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
-                  POWERVM_USER: ${{ secrets.POWERVM_USER }}
-                  CENTOS_VERSION: ${{ github.event.inputs.centos_version || '10' }}
-                  TARGET_DISK_SIZE: ${{ github.event.inputs.target_disk_size || '120' }}
-              run: |
-                  echo "Running conversion on PowerVM..."
+      - name: Download and convert CentOS ${{ matrix.centos_version }} image on PowerVM
+        env:
+          POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
+          POWERVM_USER: ${{ secrets.POWERVM_USER }}
+          CENTOS_VERSION: ${{ github.event.inputs.centos_version || matrix.centos_version }}
+          IMAGE_SIZE: ${{ github.event.inputs.image_size || '120' }}
+        run: |
+          echo "Running conversion on PowerVM..."
 
-                  ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST} \
-                    "cd ${{ env.WORK_DIR }} && \
-                     CENTOS_VERSION=${CENTOS_VERSION} \
-                     WORK_DIR=${{ env.WORK_DIR }} \
-                     IMAGE_PREP_TEMPLATE=${{ env.WORK_DIR }}/image-prep.template.static \
-                     TARGET_DISK_SIZE=${TARGET_DISK_SIZE} \
-                     ./download-and-convert-centos.sh"
+          # Add SSH keep-alive to prevent timeout during long operations (compression can take 30+ minutes)
+          # Use 'set -e' to ensure the remote script's exit code is propagated
+          if ! ssh -i ~/.ssh/powervm_key \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=60 \
+            -o ServerAliveCountMax=120 \
+            -o TCPKeepAlive=yes \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "cd ${{ env.WORK_DIR }} && \
+             CENTOS_VERSION=${CENTOS_VERSION} \
+             WORK_DIR=${{ env.WORK_DIR }} \
+             IMAGE_PREP_TEMPLATE=${{ env.WORK_DIR }}/image-prep.template.static \
+             IMAGE_SIZE=${IMAGE_SIZE} \
+             ./download-and-convert-centos.sh"; then
+            echo "ERROR: Conversion failed on PowerVM"
+            exit 1
+          fi
 
-            - name: Download metadata and OVA from PowerVM
-              env:
-                  POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
-                  POWERVM_USER: ${{ secrets.POWERVM_USER }}
-              run: |
-                  echo "Downloading files from PowerVM..."
+          echo "Conversion completed successfully"
 
-                  # Download metadata
-                  scp -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST}:${{ env.WORK_DIR }}/image-metadata.json \
-                    ${{ env.WORK_DIR }}/ || echo "Metadata not found"
+      - name: Set environment-specific variables
+        id: set-env
+        run: |
+          ENVIRONMENT="${{ github.event.inputs.environment || 'production' }}"
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
 
-                  # Download OVA file
-                  OVA_FILE=$(ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST} \
-                    "find ${{ env.WORK_DIR }} -name '*.ova.gz' -type f | head -1")
+          if [ "$ENVIRONMENT" = "staging" ]; then
+            echo "powervs_instance_id=${{ secrets.POWERVS_STAGING_INSTANCE_ID }}" >> $GITHUB_OUTPUT
+            echo "cos_bucket_name=${{ secrets.COS_STAGING_BUCKET_NAME }}" >> $GITHUB_OUTPUT
+          else
+            echo "powervs_instance_id=${{ secrets.POWERVS_PROD_INSTANCE_ID }}" >> $GITHUB_OUTPUT
+            echo "cos_bucket_name=${{ secrets.COS_PROD_BUCKET_NAME }}" >> $GITHUB_OUTPUT
+          fi
 
-                  if [ -n "$OVA_FILE" ]; then
-                    echo "Downloading OVA: $OVA_FILE"
-                    scp -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                      ${POWERVM_USER}@${POWERVM_HOST}:${OVA_FILE} \
-                      ${{ env.WORK_DIR }}/
-                    
-                    # Update metadata with local OVA path
-                    OVA_FILENAME=$(basename "$OVA_FILE")
-                    jq --arg ova "${{ env.WORK_DIR }}/${OVA_FILENAME}" \
-                      '.ova_file = $ova' \
-                      ${{ env.WORK_DIR }}/image-metadata.json > ${{ env.WORK_DIR }}/image-metadata.json.tmp
-                    mv ${{ env.WORK_DIR }}/image-metadata.json.tmp ${{ env.WORK_DIR }}/image-metadata.json
-                  else
-                    echo "ERROR: OVA file not found on PowerVM"
-                    exit 1
-                  fi
+      - name: Upload OVA to IBM Cloud Object Storage on PowerVM
+        env:
+          POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
+          POWERVM_USER: ${{ secrets.POWERVM_USER }}
+          IBM_API_KEY: ${{ secrets.IBM_API_KEY }}
+          COS_INSTANCE_NAME: ${{ secrets.COS_INSTANCE_NAME }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+        run: |
+          echo "Uploading to bucket: ${{ steps.set-env.outputs.cos_bucket_name }}"
 
-            - name: Upload OVA to IBM Cloud Object Storage
-              env:
-                  IBM_API_KEY: ${{ secrets.IBM_API_KEY }}
-                  COS_BUCKET_NAME: ${{ secrets.COS_BUCKET_NAME }}
-                  COS_REGION: ${{ secrets.COS_REGION }}
-                  WORK_DIR: ${{ env.WORK_DIR }}
-              run: |
-                  bash hack/scripts/upload-to-cos.sh
+          ssh -i ~/.ssh/powervm_key \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=60 \
+            -o ServerAliveCountMax=120 \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "cd ${{ env.WORK_DIR }} && \
+             IBM_API_KEY='${IBM_API_KEY}' \
+             COS_BUCKET_NAME='${{ steps.set-env.outputs.cos_bucket_name }}' \
+             COS_INSTANCE_NAME='${COS_INSTANCE_NAME}' \
+             COS_REGION='${COS_REGION}' \
+             WORK_DIR=${{ env.WORK_DIR }} \
+             ./upload-to-cos.sh"
 
-            - name: Import image to PowerVS workspace
-              env:
-                  IBM_API_KEY: ${{ secrets.IBM_API_KEY }}
-                  POWERVS_WORKSPACE_CRN: ${{ secrets.POWERVS_WORKSPACE_CRN }}
-                  COS_BUCKET_NAME: ${{ secrets.COS_BUCKET_NAME }}
-                  COS_REGION: ${{ secrets.COS_REGION }}
-                  WORK_DIR: ${{ env.WORK_DIR }}
-              run: |
-                  bash hack/scripts/import-to-powervs.sh
+      - name:
+          Import image to PowerVS workspace (${{ steps.set-env.outputs.environment
+          }})
+        env:
+          POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
+          POWERVM_USER: ${{ secrets.POWERVM_USER }}
+          IBM_API_KEY: ${{ secrets.IBM_API_KEY }}
+          COS_REGION: ${{ secrets.COS_REGION }}
+          COS_HMAC_ACCESS_KEY: ${{ secrets.COS_HMAC_ACCESS_KEY }}
+          COS_HMAC_SECRET_KEY: ${{ secrets.COS_HMAC_SECRET_KEY }}
+        run: |
+          echo "Deploying to ${{ steps.set-env.outputs.environment }} environment"
+          echo "PowerVS Instance ID: ${{ steps.set-env.outputs.powervs_instance_id }}"
+          echo "COS Bucket: ${{ steps.set-env.outputs.cos_bucket_name }}"
 
-            - name: Cleanup files on PowerVM
-              if: always()
-              env:
-                  POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
-                  POWERVM_USER: ${{ secrets.POWERVM_USER }}
-              run: |
-                  echo "Cleaning up PowerVM..."
-                  ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
-                    ${POWERVM_USER}@${POWERVM_HOST} \
-                    "rm -rf ${{ env.WORK_DIR }}/*" || echo "Cleanup failed but continuing"
+          ssh -i ~/.ssh/powervm_key \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=60 \
+            -o ServerAliveCountMax=120 \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "cd ${{ env.WORK_DIR }} && \
+             IBM_API_KEY='${IBM_API_KEY}' \
+             POWERVS_INSTANCE_ID='${{ steps.set-env.outputs.powervs_instance_id }}' \
+             COS_BUCKET_NAME='${{ steps.set-env.outputs.cos_bucket_name }}' \
+             COS_REGION='${COS_REGION}' \
+             COS_HMAC_ACCESS_KEY='${COS_HMAC_ACCESS_KEY}' \
+             COS_HMAC_SECRET_KEY='${COS_HMAC_SECRET_KEY}' \
+             WORK_DIR=${{ env.WORK_DIR }} \
+             ./import-to-powervs.sh"
 
-            - name: Send Slack notification
-              if: always()
-              env:
-                  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-                  JOB_STATUS: ${{ job.status }}
-                  WORK_DIR: ${{ env.WORK_DIR }}
-              run: |
-                  bash hack/scripts/send-notification.sh
+      - name: Cleanup PowerVM after successful completion
+        if: success()
+        env:
+          POWERVM_HOST: ${{ secrets.POWERVM_HOST }}
+          POWERVM_USER: ${{ secrets.POWERVM_USER }}
+        run: |
+          echo "All steps completed successfully - cleaning up PowerVM..."
+          ssh -i ~/.ssh/powervm_key -o StrictHostKeyChecking=no \
+            ${POWERVM_USER}@${POWERVM_HOST} \
+            "rm -rf ${{ env.WORK_DIR }}/* && rm -rf /tmp/qcow2ova*" || echo "Cleanup warning (non-critical)"
+          echo "PowerVM cleanup completed"
 
-            - name: Upload workflow artifacts
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: centos-image-automation-${{ github.run_number }}
-                  path: |
-                      ${{ env.WORK_DIR }}/*.log
-                      ${{ env.WORK_DIR }}/*.json
-                  retention-days: 30
+      # Notification step removed - can be added later if needed
+      # Options: Email, Slack, or other notification services
 
-            - name: Cleanup SSH key
-              if: always()
-              run: |
-                  rm -f ~/.ssh/powervm_key
+      - name: Upload workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: centos-image-automation-${{ github.run_number }}
+          path: |
+            ${{ env.WORK_DIR }}/*.log
+            ${{ env.WORK_DIR }}/*.json
+          retention-days: 30
 
-# Automation for CentOS image creation for PAC
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          rm -f ~/.ssh/powervm_key

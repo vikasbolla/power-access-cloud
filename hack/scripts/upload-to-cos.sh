@@ -72,6 +72,9 @@ get_ova_file() {
     echo "$ova_file"
 }
 
+# Note: pvsadm doesn't have a direct command to list COS objects
+# We'll handle the duplicate error gracefully during upload
+
 # Upload OVA to COS using pvsadm
 upload_to_cos() {
     local ova_file="$1"
@@ -85,23 +88,43 @@ upload_to_cos() {
     # Set IBM Cloud API key
     export IBMCLOUD_API_KEY="$IBM_API_KEY"
     
-    # Upload using pvsadm
+    # Upload using pvsadm (will handle duplicate error gracefully)
     log_info "Starting upload with pvsadm..."
     
-    pvsadm image upload \
+    # Capture output and check for duplicate error
+    local upload_output="${WORK_DIR}/upload_attempt.log"
+    
+    if pvsadm image upload \
         --bucket "$COS_BUCKET_NAME" \
         --bucket-region "$COS_REGION" \
-        --file "$ova_file" \
-        --object-name "$ova_filename" \
-        2>&1 | tee "${WORK_DIR}/upload.log"
-    
-    local upload_status=$?
-    
-    if [ $upload_status -eq 0 ]; then
+        --cos-instance-name "$COS_INSTANCE_NAME" \
+        -f "$ova_file" \
+        2>&1 | tee "$upload_output" | awk '
+            /[0-9]+%/ {
+                match($0, /([0-9]+)%/, arr)
+                percent = arr[1]
+                if (percent >= 20 && percent % 20 == 0 && percent != last) {
+                    print "[INFO] Upload progress: " percent "%"
+                    last = percent
+                }
+                next
+            }
+            { print }
+        ' | tee "${WORK_DIR}/upload.log"; then
         log_info "Upload completed successfully"
     else
-        log_error "Upload failed with status: $upload_status"
-        exit 1
+        # Check if error is due to file already existing
+        if grep -q "object already exists" "$upload_output"; then
+            log_warn "=========================================="
+            log_warn "File already exists in COS bucket"
+            log_warn "This is expected on retry - continuing..."
+            log_warn "=========================================="
+            # Not a fatal error, continue
+        else
+            log_error "Upload failed with unexpected error"
+            cat "$upload_output" >&2
+            exit 1
+        fi
     fi
     
     # Update metadata with COS information

@@ -7,7 +7,10 @@ set -o pipefail
 # Configuration
 WORK_DIR="${WORK_DIR:-/tmp/centos-images}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
+SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
+SLACK_CHANNEL_ID="${SLACK_CHANNEL_ID:-}"
 JOB_STATUS="${JOB_STATUS:-unknown}"
+ENVIRONMENT="${ENVIRONMENT:-production}"
 GITHUB_RUN_ID="${GITHUB_RUN_ID:-}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}"
 GITHUB_SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
@@ -30,13 +33,20 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if Slack webhook is configured
+# Check if Slack is configured (webhook or bot token + channel)
 check_slack_config() {
-    if [ -z "$SLACK_WEBHOOK_URL" ]; then
-        log_warn "SLACK_WEBHOOK_URL not configured, skipping notification"
+    if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        log_info "Using Slack Webhook URL"
+        return 0
+    elif [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ]; then
+        log_info "Using Slack Bot Token with Channel ID: $SLACK_CHANNEL_ID"
+        return 0
+    else
+        log_warn "Slack not configured. Set either:"
+        log_warn "  - SLACK_WEBHOOK_URL, or"
+        log_warn "  - SLACK_BOT_TOKEN + SLACK_CHANNEL_ID"
         return 1
     fi
-    return 0
 }
 
 # Get image metadata
@@ -64,9 +74,15 @@ build_success_message() {
         workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
     fi
     
+    # Determine environment emoji
+    local env_emoji="🚀"
+    if [ "$ENVIRONMENT" = "staging" ]; then
+        env_emoji="🧪"
+    fi
+    
     cat <<EOF
 {
-  "text": "✅ CentOS Image Automation - Success",
+  "text": "✅ CentOS Image Automation - Success (${ENVIRONMENT})",
   "blocks": [
     {
       "type": "header",
@@ -74,6 +90,13 @@ build_success_message() {
         "type": "plain_text",
         "text": "✅ CentOS Image Update - Success",
         "emoji": true
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "${env_emoji} *Environment:* \`${ENVIRONMENT}\`"
       }
     },
     {
@@ -148,9 +171,15 @@ build_failure_message() {
         error_msg=$(tail -20 "${WORK_DIR}/conversion.log" | grep -i "error" | head -5 | sed 's/"/\\"/g' || echo "Check conversion.log for details")
     fi
     
+    # Determine environment emoji
+    local env_emoji="🚀"
+    if [ "$ENVIRONMENT" = "staging" ]; then
+        env_emoji="🧪"
+    fi
+    
     cat <<EOF
 {
-  "text": "❌ CentOS Image Automation - Failed",
+  "text": "❌ CentOS Image Automation - Failed (${ENVIRONMENT})",
   "blocks": [
     {
       "type": "header",
@@ -164,7 +193,7 @@ build_failure_message() {
       "type": "section",
       "text": {
         "type": "mrkdwn",
-        "text": "*Status:* Failed\n*Error:* ${error_msg}"
+        "text": "${env_emoji} *Environment:* \`${ENVIRONMENT}\`\n*Status:* Failed\n*Error:* ${error_msg}"
       }
     },
     {
@@ -198,11 +227,11 @@ EOF
 EOF
 }
 
-# Send notification to Slack
-send_notification() {
+# Send notification to Slack via Webhook
+send_via_webhook() {
     local message="$1"
     
-    log_info "Sending notification to Slack..."
+    log_info "Sending via Webhook..."
     
     local response=$(curl -s -X POST \
         -H 'Content-Type: application/json' \
@@ -210,10 +239,57 @@ send_notification() {
         "$SLACK_WEBHOOK_URL")
     
     if [ "$response" == "ok" ]; then
-        log_info "Notification sent successfully"
+        log_info "Notification sent successfully via webhook"
         return 0
     else
-        log_error "Failed to send notification: $response"
+        log_error "Failed to send via webhook: $response"
+        return 1
+    fi
+}
+
+# Send notification to Slack via Bot Token
+send_via_bot_token() {
+    local message="$1"
+    
+    log_info "Sending via Bot Token to channel: $SLACK_CHANNEL_ID"
+    
+    # Build the payload properly using jq to avoid JSON escaping issues
+    local payload=$(echo "$message" | jq -c --arg channel "$SLACK_CHANNEL_ID" '. + {channel: $channel}')
+    
+    # Debug: Show payload (first 200 chars)
+    log_info "Payload preview: ${payload:0:200}..."
+    
+    local response=$(curl -s -X POST \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "$payload" \
+        "https://slack.com/api/chat.postMessage")
+    
+    local ok=$(echo "$response" | jq -r '.ok')
+    
+    if [ "$ok" == "true" ]; then
+        log_info "Notification sent successfully via bot token"
+        return 0
+    else
+        local error=$(echo "$response" | jq -r '.error // "unknown error"')
+        log_error "Failed to send via bot token: $error"
+        log_error "Response: $response"
+        return 1
+    fi
+}
+
+# Send notification to Slack (auto-detect method)
+send_notification() {
+    local message="$1"
+    
+    log_info "Sending notification to Slack..."
+    
+    if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        send_via_webhook "$message"
+    elif [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$SLACK_CHANNEL_ID" ]; then
+        send_via_bot_token "$message"
+    else
+        log_error "No Slack configuration found"
         return 1
     fi
 }
