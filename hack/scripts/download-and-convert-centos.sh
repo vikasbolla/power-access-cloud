@@ -160,17 +160,55 @@ download_image() {
     local image_name=$(basename "$image_url")
     local image_path="${WORK_DIR}/${image_name}"
     
+    # Extract date from image name to check for existing OVA
+    local date_part=$(echo "$image_name" | grep -oP '\d{8}' | head -1)
+    local ova_pattern="centos-${CENTOS_VERSION}-stream-${date_part}*.ova.gz"
+    
+    # Check if OVA already exists - if so, skip download entirely
+    local existing_ova=$(find "$WORK_DIR" -name "$ova_pattern" -type f 2>/dev/null | head -1)
+    if [ -n "$existing_ova" ] && [ -f "$existing_ova" ]; then
+        log_info "=========================================="
+        log_info "OVA already exists: $(basename "$existing_ova")"
+        log_info "Skipping download and conversion"
+        log_info "To force re-download, delete: $existing_ova"
+        log_info "=========================================="
+        # Return a dummy path since we won't use it
+        echo "$image_path"
+        return 0
+    fi
+    
+    # Check if qcow2 image already exists and is valid
+    if [ -f "$image_path" ]; then
+        local file_size=$(stat -f%z "$image_path" 2>/dev/null || stat -c%s "$image_path" 2>/dev/null)
+        if [ "$file_size" -gt 100000000 ]; then  # > 100MB, likely valid
+            log_info "=========================================="
+            log_info "Image already exists: $image_name"
+            log_info "Size: $(du -h "$image_path" | cut -f1)"
+            log_info "Skipping download to save time"
+            log_info "To force re-download, delete: $image_path"
+            log_info "=========================================="
+            echo "$image_path"
+            return 0
+        else
+            log_warn "Existing file is too small, re-downloading..."
+            rm -f "$image_path"
+        fi
+    fi
+    
     log_info "Downloading image: $image_name"
     log_info "URL: $image_url"
     
     # Download with progress - try wget first, fall back to curl
     if command -v wget &> /dev/null; then
         log_info "Using wget for download..."
-        wget -c -O "$image_path" "$image_url" >&2
+        wget -c -O "$image_path" "$image_url" 2>&1 | \
+            grep --line-buffered -oP '\d+%' | \
+            awk '{if ($1 ~ /^(20|40|60|80|100)%$/) print "[INFO] Download progress: " $1}' >&2
     elif command -v curl &> /dev/null; then
         log_info "Using curl for download (this may take 5-10 minutes)..."
-        # Use --progress-bar for simpler output, or -s for silent
-        curl -# -L -C - -o "$image_path" "$image_url" >&2
+        curl -L -C - -o "$image_path" "$image_url" 2>&1 | \
+            grep --line-buffered -oP '\d+\.\d+' | \
+            awk '{p=int($1); if (p>=20 && p%20==0 && p!=last) {print "[INFO] Download progress: " p "%"; last=p}}' >&2
     else
         log_error "Neither wget nor curl is available"
         exit 1
@@ -284,6 +322,17 @@ convert_to_ova() {
     log_info "Conversion completed successfully"
     log_info "OVA file: $ova_file"
     
+    # Clean up pvsadm temporary directories immediately after conversion
+    log_info "Cleaning up pvsadm temporary directories..."
+    sleep 2  # Wait for pvsadm to fully release file handles
+    find /tmp -maxdepth 1 -type d -name "qcow2ova*" ! -newer "$ova_file" -exec rm -rf {} \; 2>/dev/null || true
+    
+    # Clean up qcow2 file if OVA exists (saves ~1-2GB)
+    if [ -f "$ova_file" ] && [ -f "$qcow2_path" ]; then
+        log_info "Removing qcow2 file to save space (OVA already created)..."
+        rm -f "$qcow2_path"
+    fi
+    
     # Save metadata
     cat > "${WORK_DIR}/image-metadata.json" <<EOF
 {
@@ -299,6 +348,31 @@ EOF
     echo "$ova_file"
 }
 
+# Cleanup old pvsadm processes and temp directories
+cleanup_old_pvsadm() {
+    log_info "Cleaning up old pvsadm processes and temp directories..."
+    
+    # Kill any old pvsadm processes (older than 4 hours)
+    if ps aux 2>/dev/null | grep -q '[p]vsadm'; then
+        ps aux | grep '[p]vsadm' | awk '{print $2}' | while read pid; do
+            if [ -n "$pid" ]; then
+                # Check if process is older than 4 hours
+                start_time=$(ps -p $pid -o etimes= 2>/dev/null | tr -d ' ')
+                if [ -n "$start_time" ] && [ "$start_time" -gt 14400 ]; then
+                    log_warn "Killing old pvsadm process: $pid (running for ${start_time}s)"
+                    kill -9 $pid 2>/dev/null || true
+                fi
+            fi
+        done
+    fi
+    
+    # Remove old pvsadm temp directories (older than 1 day)
+    find /tmp -maxdepth 1 -type d -name "qcow2ova*" -mtime +0 -exec rm -rf {} \; 2>/dev/null || true
+    
+    # Wait a moment for file handles to be released
+    sleep 2
+}
+
 # Main execution
 main() {
     log_info "Starting CentOS Stream ${CENTOS_VERSION} image download and conversion"
@@ -307,6 +381,9 @@ main() {
     # Create work directory
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
+    
+    # Cleanup old pvsadm artifacts first
+    cleanup_old_pvsadm
     
     # Pre-flight checks
     check_architecture
@@ -330,9 +407,12 @@ main() {
     log_info "Metadata: ${WORK_DIR}/image-metadata.json"
     log_info "=========================================="
     
-    # Display file sizes
+    # Display file sizes (only show files that exist)
     log_info "File sizes:"
-    ls -lh "$qcow2_path" "$ova_file"
+    if [ -f "$qcow2_path" ]; then
+        ls -lh "$qcow2_path" 2>/dev/null || true
+    fi
+    ls -lh "$ova_file" 2>/dev/null || true
 }
 
 # Run main function

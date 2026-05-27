@@ -3,9 +3,13 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Backup original resolv.conf
 mv /etc/resolv.conf /etc/resolv.conf.orig || true
-echo "nameserver 10.0.10.4" | tee /etc/resolv.conf
-echo "nameserver 10.0.10.5" | tee /etc/resolv.conf
+
+# Temporarily use public DNS for package installation to avoid DNS resolution issues
+echo "nameserver 8.8.8.8" | tee /etc/resolv.conf
+echo "nameserver 1.1.1.1" | tee -a /etc/resolv.conf
+
 {{if eq .Dist "rhel"}}
 subscription-manager register --force --auto-attach --username={{ .RHNUser }} --password={{ .RHNPassword }}
 {{end}}
@@ -28,6 +32,7 @@ yum-config-manager --add-repo=https://public.dhe.ibm.com/software/server/POWER/L
 rpm --import https://public.dhe.ibm.com/software/server/POWER/Linux/yum/IBM/RHEL/$(rpm -E %{rhel})/ppc64le/repodata/repomd.xml.key
 {{end}}
 
+# Continue using public DNS for additional package installations
 yum install  powerpc-utils librtas DynamicRM  devices.chrp.base.ServiceRM rsct.opt.storagerm rsct.core rsct.basic rsct.core src -y
 yum install -y device-mapper-multipath
 cat <<EOF > /etc/multipath.conf
@@ -93,7 +98,9 @@ subscription-manager clean
 # Remove the ibm repositories used for the rsct installation
 rpm -e ibm-power-repo-*.noarch
 
-mv /etc/resolv.conf.orig /etc/resolv.conf || true
+# Restore internal DNS servers for the final image
+echo "nameserver 10.0.10.4" | tee /etc/resolv.conf
+echo "nameserver 10.0.10.5" | tee -a /etc/resolv.conf
 touch /.autorelabel
 
 # enabling and configuring firewalld

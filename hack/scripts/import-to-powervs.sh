@@ -8,10 +8,20 @@ set -o pipefail
 # Configuration
 WORK_DIR="${WORK_DIR:-/tmp/centos-images}"
 IBM_API_KEY="${IBM_API_KEY:?IBM_API_KEY environment variable is required}" # pragma: allowlist secret
-POWERVS_WORKSPACE_CRN="${POWERVS_WORKSPACE_CRN:?POWERVS_WORKSPACE_CRN environment variable is required}"
+POWERVS_INSTANCE_ID="${POWERVS_INSTANCE_ID:-}"
+POWERVS_INSTANCE_NAME="${POWERVS_INSTANCE_NAME:-}"
+POWERVS_WORKSPACE_CRN="${POWERVS_WORKSPACE_CRN:-}"
 COS_BUCKET_NAME="${COS_BUCKET_NAME:?COS_BUCKET_NAME environment variable is required}"
 COS_REGION="${COS_REGION:-us-south}"
+COS_HMAC_ACCESS_KEY="${COS_HMAC_ACCESS_KEY:-}"
+COS_HMAC_SECRET_KEY="${COS_HMAC_SECRET_KEY:-}"
 IMPORT_TIMEOUT="${IMPORT_TIMEOUT:-3600}"  # 1 hour timeout
+
+# Check that at least one PowerVS identifier is provided
+if [ -z "$POWERVS_INSTANCE_ID" ] && [ -z "$POWERVS_INSTANCE_NAME" ] && [ -z "$POWERVS_WORKSPACE_CRN" ]; then
+    log_error "One of POWERVS_INSTANCE_ID, POWERVS_INSTANCE_NAME, or POWERVS_WORKSPACE_CRN is required"
+    exit 1
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -61,6 +71,52 @@ get_image_metadata() {
     cat "$metadata_file"
 }
 
+# Get PowerVS instance identifier (ID or name)
+get_pvs_instance() {
+    # Priority: POWERVS_INSTANCE_ID > POWERVS_INSTANCE_NAME > extract from CRN
+    if [ -n "$POWERVS_INSTANCE_ID" ]; then
+        echo "$POWERVS_INSTANCE_ID"
+        return 0
+    elif [ -n "$POWERVS_INSTANCE_NAME" ]; then
+        echo "$POWERVS_INSTANCE_NAME"
+        return 0
+    elif [ -n "$POWERVS_WORKSPACE_CRN" ]; then
+        # CRN format: crn:v1:bluemix:public:power-iaas:region:a/account:workspace-id::
+        # Extract the workspace-id part (second to last segment)
+        local instance_id=$(echo "$POWERVS_WORKSPACE_CRN" | awk -F: '{print $(NF-1)}')
+        if [ -n "$instance_id" ]; then
+            echo "$instance_id"
+            return 0
+        fi
+    fi
+    
+    log_error "Could not determine PowerVS instance ID or name"
+    return 1
+}
+
+# Check if image already exists in PowerVS
+check_image_exists() {
+    local image_name="$1"
+    local pvs_instance="$2"
+    local get_flag="$3"
+    
+    log_info "Checking if image already exists in PowerVS..."
+    
+    export IBMCLOUD_API_KEY="$IBM_API_KEY"
+    
+    # List images and check if our image exists
+    local existing_image=$(pvsadm get images $get_flag "$pvs_instance" --json 2>/dev/null | \
+        jq -r --arg name "$image_name" '.[] | select(.name == $name) | .name' | head -1)
+    
+    if [ -n "$existing_image" ]; then
+        log_info "Image already exists in PowerVS: $existing_image"
+        return 0
+    else
+        log_info "Image not found in PowerVS, will proceed with import"
+        return 1
+    fi
+}
+
 # Import image to PowerVS
 import_image() {
     local image_name="$1"
@@ -69,24 +125,60 @@ import_image() {
     log_info "Importing image to PowerVS workspace"
     log_info "Image name: $image_name"
     log_info "COS object: $cos_object_name"
-    log_info "Workspace CRN: $POWERVS_WORKSPACE_CRN"
     
     # Set IBM Cloud API key
     export IBMCLOUD_API_KEY="$IBM_API_KEY"
+    
+    # Get PowerVS instance identifier
+    local pvs_instance=$(get_pvs_instance)
+    if [ $? -ne 0 ]; then
+        log_error "Failed to get PowerVS instance identifier"
+        exit 1
+    fi
+    
+    # Determine if it's an ID or name
+    local import_flag=""
+    local get_flag=""
+    if [ -n "$POWERVS_INSTANCE_ID" ] || [ -n "$POWERVS_WORKSPACE_CRN" ]; then
+        import_flag="--pvs-instance-id"
+        get_flag="--pvs-instance-id"
+        log_info "Using PowerVS Instance ID: $pvs_instance"
+    else
+        import_flag="--pvs-instance-name"
+        get_flag="--pvs-instance-name"
+        log_info "Using PowerVS Instance Name: $pvs_instance"
+    fi
+    
+    # Check if image already exists
+    if check_image_exists "$image_name" "$pvs_instance" "$get_flag"; then
+        log_info "=========================================="
+        log_info "Image already exists in PowerVS workspace"
+        log_info "Skipping import to avoid duplicate"
+        log_info "To force re-import, delete the existing image first"
+        log_info "=========================================="
+        return 0
+    fi
     
     # Import using pvsadm
     log_info "Starting import with pvsadm..."
     
     local import_output="${WORK_DIR}/import-output.json"
     
-    pvsadm image import \
-        --workspace-crn "$POWERVS_WORKSPACE_CRN" \
-        --bucket "$COS_BUCKET_NAME" \
-        --bucket-region "$COS_REGION" \
-        --object "$cos_object_name" \
-        --pvs-image-name "$image_name" \
-        --watch \
-        2>&1 | tee "${WORK_DIR}/import.log"
+    # Build import command
+    local import_cmd="pvsadm image import $import_flag \"$pvs_instance\" --bucket \"$COS_BUCKET_NAME\" --bucket-region \"$COS_REGION\" --object \"$cos_object_name\" --pvs-image-name \"$image_name\""
+    
+    # Add HMAC credentials if provided
+    if [ -n "$COS_HMAC_ACCESS_KEY" ] && [ -n "$COS_HMAC_SECRET_KEY" ]; then
+        import_cmd="$import_cmd --accesskey \"$COS_HMAC_ACCESS_KEY\" --secretkey \"$COS_HMAC_SECRET_KEY\""
+        log_info "Using HMAC credentials for COS access"
+    else
+        log_info "No HMAC credentials provided, pvsadm will auto-generate service credentials"
+    fi
+    
+    import_cmd="$import_cmd --watch"
+    
+    log_info "Running import command..."
+    eval "$import_cmd" 2>&1 | tee "${WORK_DIR}/import.log"
     
     local import_status=$?
     
@@ -106,8 +198,11 @@ get_image_id() {
     
     export IBMCLOUD_API_KEY="$IBM_API_KEY"
     
+    # Extract PowerVS instance ID from CRN
+    local pvs_instance_id=$(extract_pvs_instance "$POWERVS_WORKSPACE_CRN")
+    
     # List images and find the one we just imported
-    local image_id=$(pvsadm get images --workspace-crn "$POWERVS_WORKSPACE_CRN" --json 2>/dev/null | \
+    local image_id=$(pvsadm get images --pvs-instance-id "$pvs_instance_id" --json 2>/dev/null | \
         jq -r --arg name "$image_name" '.[] | select(.name == $name) | .imageID' | head -1)
     
     if [ -z "$image_id" ] || [ "$image_id" == "null" ]; then
