@@ -35,7 +35,7 @@
   },
   "scripts": {
     "dev": "chmod +x ./env.sh && ./env.sh && cp env-config.js ./public/ && vite",
-    "start": "env-cmd vite",
+    "start": "env-cmd -- vite",
     "build": "vite build"
   },
   "eslintConfig": {
