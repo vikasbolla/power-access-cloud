@@ -96,6 +96,10 @@ type VMCatalog struct {
 	// +optional
 	// Volumes is a list of volume specifications to create and attach during deployment
 	Volumes []VolumeSpec `json:"volumes,omitempty"`
+	// +optional
+	// Kubernetes indicates that the VM should be bootstrapped as a single-node Kubernetes cluster
+	// using the k8s cloud-init script instead of the default user-data.
+	Kubernetes bool `json:"kubernetes,omitempty"`
 }
 
 //+kubebuilder:object:root=true

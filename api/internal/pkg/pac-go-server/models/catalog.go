@@ -25,4 +25,5 @@ type VM struct {
 	Image         string   `json:"image"`
 	Network       string   `json:"network"`
 	Capacity      Capacity `json:"capacity"`
+	Kubernetes    bool     `json:"kubernetes,omitempty"`
 }

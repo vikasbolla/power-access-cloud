@@ -258,6 +258,7 @@ func convertToCatalog(catalogItem pac.Catalog) models.Catalog {
 			SystemType:    catalogItem.Spec.VM.SystemType,
 			Image:         catalogItem.Spec.VM.Image,
 			Network:       catalogItem.Spec.VM.Network,
+			Kubernetes:    catalogItem.Spec.VM.Kubernetes,
 			Capacity: models.Capacity{
 				Memory: catalogItem.Spec.Capacity.Memory,
 				CPU:    cpu,
@@ -348,6 +349,7 @@ func createCatalogObject(catalog models.Catalog) pac.Catalog {
 			SystemType:    catalog.VM.SystemType,
 			Image:         catalog.VM.Image,
 			Network:       catalog.VM.Network,
+			Kubernetes:    catalog.VM.Kubernetes,
 			Capacity: pac.Capacity{
 				CPU:    utils.CastFloatToStr(catalog.VM.Capacity.CPU),
 				Memory: catalog.VM.Capacity.Memory,

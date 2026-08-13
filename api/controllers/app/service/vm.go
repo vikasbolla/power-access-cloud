@@ -30,6 +30,15 @@ const (
 //go:embed templates/userdata.yaml
 var userDataTemplate string
 
+//go:embed templates/k8s-userdata.yaml
+var k8sUserDataTemplate string
+
+// templateLogger is the minimal logging interface required by getK8SUserDataWithLogger.
+// scope.Logger satisfies this interface; tests can provide their own implementation.
+type templateLogger interface {
+	Error(err error, msg string, keysAndValues ...interface{})
+}
+
 var (
 	ErroNoPublicNetwork = errors.New("no public network available to use for vm creation")
 	dnsServers          = []string{"9.9.9.9", "1.1.1.1"}
@@ -277,7 +286,7 @@ func createVM(scope *scope.ServiceScope) error {
 	memory := float64(vmSpec.Capacity.Memory)
 	processors, _ := strconv.ParseFloat(vmSpec.Capacity.CPU, 64)
 
-	userData := getUserData(vmSpec.OS, scope)
+	userData := getUserData(vmSpec, scope)
 
 	// Create volumes from catalog spec if specified
 	volumeIDs, err := createVolumesFromCatalog(scope, vmSpec, imageRef)
@@ -421,17 +430,18 @@ func createVolumesFromCatalog(scope *scope.ServiceScope, vmCatalog appv1alpha1.V
 	return createVolumes(scope, vmCatalog.Volumes, imageStoragePool)
 }
 
-func getUserData(OS string, scope *scope.ServiceScope) string {
-	var userData string
-	switch OS {
+func getUserData(vmSpec appv1alpha1.VMCatalog, scope *scope.ServiceScope) string {
+	if vmSpec.Kubernetes {
+		return getK8SUserDataWithLogger(scope.Service.Spec.SSHKeys, scope.Logger)
+	}
+	switch vmSpec.OS {
 	case IbmiOS:
-		userData = getIBMiUserData(scope.Service.Spec.SSHKeys, IbmiUsername, scope)
+		return getIBMiUserData(scope.Service.Spec.SSHKeys, IbmiUsername, scope)
 	default:
-		userData = base64.StdEncoding.EncodeToString(
+		return base64.StdEncoding.EncodeToString(
 			[]byte(strings.Join(scope.Service.Spec.SSHKeys, "\n")),
 		)
 	}
-	return userData
 }
 
 func getIBMiUserData(sshKeys []string, username string, scope *scope.ServiceScope) string {
@@ -451,6 +461,25 @@ func getIBMiUserData(sshKeys []string, username string, scope *scope.ServiceScop
 	})
 	if err != nil {
 		scope.Logger.Error(err, "error executing cloud-init template")
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+// getK8SUserDataWithLogger renders the k8s cloud-init template with the given
+// SSH keys and returns the result as a base64-encoded string.  The logger
+// parameter allows callers that don't have a full scope (e.g. tests) to supply
+// a lightweight implementation without a circular dependency.
+func getK8SUserDataWithLogger(sshKeys []string, log templateLogger) string {
+	allKeys := strings.Join(sshKeys, "\n")
+	tmpl, err := template.New("k8s-userdata").Parse(k8sUserDataTemplate)
+	if err != nil {
+		log.Error(err, "error parsing k8s cloud-init template")
+		return ""
+	}
+	var buf bytes.Buffer
+	if err = tmpl.Execute(&buf, struct{ Keys string }{Keys: allKeys}); err != nil {
+		log.Error(err, "error executing k8s cloud-init template")
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
