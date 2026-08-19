@@ -1,0 +1,262 @@
+// CentOS Image Automation Pipeline
+// Runs on pac-agent (ppc64le Power VM node) which has pvsadm installed.
+// Downloads the latest CentOS Stream qcow2 image, converts it to OVA using
+// pvsadm, uploads the OVA to IBM Cloud Object Storage, and imports it into
+// a PowerVS workspace.
+
+@Library('pac-shared-lib') _
+
+pipeline {
+    agent { label 'pac-agent' }
+
+    options {
+        timestamps()
+        timeout(time: 240, unit: 'MINUTES')  // 4 hours max
+        buildDiscarder(logRotator(daysToKeepStr: '30', numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['production', 'staging'],
+            description: 'Target environment for image deployment'
+        )
+        choice(
+            name: 'CENTOS_VERSION',
+            choices: ['10', '9'],
+            description: 'CentOS Stream version to build'
+        )
+        string(
+            name: 'IMAGE_SIZE',
+            defaultValue: '120',
+            description: 'Image disk size in GB'
+        )
+    }
+
+    environment {
+        WORK_DIR       = '/data/centos-images'
+        CENTOS_VERSION = "${params.CENTOS_VERSION}"
+        IMAGE_SIZE     = "${params.IMAGE_SIZE}"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "=== Checkout repository ==="
+                checkout scm
+            }
+        }
+
+        stage('Pre-flight checks') {
+            steps {
+                echo "=== Pre-flight checks ==="
+                sh '''
+                    echo "Hostname  : $(hostname)"
+                    echo "Arch      : $(uname -m)"
+                    echo "Kernel    : $(uname -r)"
+                    echo ""
+                    echo "=== Full disk layout (df -h) ==="
+                    df -h
+                    echo ""
+                    echo "=== WORK_DIR mount point: ${WORK_DIR} ==="
+                    mkdir -p "${WORK_DIR}"
+                    df -h "${WORK_DIR}"
+                    echo ""
+                    echo "=== Available space on WORK_DIR (df -BG) ==="
+                    df -BG "${WORK_DIR}"
+                    AVAIL_GB=$(df -BG "${WORK_DIR}" | awk 'NR==2 {print $4}' | sed 's/G//')
+                    echo "Available : ${AVAIL_GB}GB  (need 170GB)"
+                    echo ""
+
+                    # Architecture must be ppc64le
+                    if [ "$(uname -m)" != "ppc64le" ]; then
+                        echo "ERROR: This pipeline must run on a ppc64le node (pac-agent)."
+                        exit 1
+                    fi
+
+                    # Install pvsadm if not present
+                    if ! command -v pvsadm &>/dev/null; then
+                        echo "pvsadm not found – installing..."
+                        PVSADM_VERSION="v0.1.13"
+                        PVSADM_URL="https://github.com/ppc64le-cloud/pvsadm/releases/download/${PVSADM_VERSION}/pvsadm-linux-ppc64le.tar.gz"
+                        curl -sL "${PVSADM_URL}" -o /tmp/pvsadm.tar.gz
+                        tar -xzf /tmp/pvsadm.tar.gz -C /tmp
+                        sudo mv /tmp/pvsadm /usr/local/bin/pvsadm
+                        rm -f /tmp/pvsadm.tar.gz
+                        echo "pvsadm installed successfully"
+                    fi
+                    pvsadm version
+
+                    # Install missing system utilities via dnf/yum
+                    MISSING=()
+                    for tool in curl jq qemu-img; do
+                        command -v "$tool" &>/dev/null || MISSING+=("$tool")
+                    done
+                    if [ ${#MISSING[@]} -gt 0 ]; then
+                        echo "Installing missing tools: ${MISSING[*]}"
+                        # qemu-img ships in the qemu-img package on RHEL/CentOS
+                        PKG_LIST=("${MISSING[@]//qemu-img/qemu-img}")
+                        if command -v dnf &>/dev/null; then
+                            sudo dnf install -y "${PKG_LIST[@]}"
+                        else
+                            sudo yum install -y "${PKG_LIST[@]}"
+                        fi
+                    fi
+
+                    echo "All pre-flight checks passed."
+                '''
+            }
+        }
+
+        stage('Prepare work directory') {
+            steps {
+                echo "=== Prepare work directory ==="
+                sh '''
+                    mkdir -p "${WORK_DIR}"
+                    cp jenkins/scripts/download-and-convert-centos.sh "${WORK_DIR}/"
+                    cp jenkins/scripts/upload-to-cos.sh               "${WORK_DIR}/"
+                    cp jenkins/scripts/import-to-powervs.sh           "${WORK_DIR}/"
+                    cp jenkins/scripts/cleanup-resources.sh           "${WORK_DIR}/"
+                    chmod +x "${WORK_DIR}"/*.sh
+
+                    # Template must exist for pvsadm qcow2ova
+                    if [ -f hack/scripts/image-prep.template.static ]; then
+                        cp hack/scripts/image-prep.template.static "${WORK_DIR}/"
+                    else
+                        echo "WARNING: image-prep.template.static not found – pvsadm will use its built-in default"
+                    fi
+
+                    echo "Work directory contents:"
+                    ls -lh "${WORK_DIR}/"
+                '''
+            }
+        }
+
+        stage('Download & Convert') {
+            steps {
+                echo "=== Download CentOS Stream ${params.CENTOS_VERSION} and convert to OVA ==="
+                sh '''
+                    cd "${WORK_DIR}"
+                    export IMAGE_PREP_TEMPLATE="${WORK_DIR}/image-prep.template.static"
+
+                    # If a previous run cleaned up the OVA but left the metadata,
+                    # remove the stale metadata so the script re-runs conversion.
+                    if [ -f image-metadata.json ]; then
+                        OVA_PATH=$(jq -r '.ova_file // empty' image-metadata.json 2>/dev/null || true)
+                        if [ -n "$OVA_PATH" ] && [ ! -f "$OVA_PATH" ]; then
+                            echo "Stale metadata detected (OVA missing: $OVA_PATH) — removing to force reconversion"
+                            rm -f image-metadata.json
+                        fi
+                    fi
+
+                    ./download-and-convert-centos.sh
+                '''
+            }
+            post {
+                always {
+                    sh 'cp /data/centos-images/conversion.log conversion.log 2>/dev/null || true'
+                    archiveArtifacts(artifacts: 'conversion.log', allowEmptyArchive: true)
+                }
+            }
+        }
+
+        stage('Upload to COS') {
+            steps {
+                echo "=== Upload OVA to IBM Cloud Object Storage ==="
+                script {
+                    def cosCredId = (params.ENVIRONMENT == 'staging') ? 'COS_STAGING_BUCKET_NAME' : 'COS_PROD_BUCKET_NAME'
+
+                    withCredentials([
+                        string(credentialsId: 'IBM_API_KEY',           variable: 'IBM_API_KEY'),
+                        string(credentialsId: cosCredId,               variable: 'COS_BUCKET_NAME'),
+                        string(credentialsId: 'COS_REGION',            variable: 'COS_REGION'),
+                        string(credentialsId: 'COS_HMAC_ACCESS_KEY',   variable: 'COS_HMAC_ACCESS_KEY'),
+                        string(credentialsId: 'COS_HMAC_SECRET_KEY',   variable: 'COS_HMAC_SECRET_KEY')
+                    ]) {
+                        sh '''
+                            cd "${WORK_DIR}"
+                            ./upload-to-cos.sh
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'cp /data/centos-images/upload.log upload.log 2>/dev/null || true'
+                    archiveArtifacts(artifacts: 'upload.log', allowEmptyArchive: true)
+                }
+            }
+        }
+
+        stage('Import to PowerVS') {
+            steps {
+                echo "=== Import image into PowerVS workspace (${params.ENVIRONMENT}) ==="
+                script {
+                    def cosBucketCredId = (params.ENVIRONMENT == 'staging') ? 'COS_STAGING_BUCKET_NAME'      : 'COS_PROD_BUCKET_NAME'
+                    def pvsCrnCredId    = (params.ENVIRONMENT == 'staging') ? 'POWERVS_STAGING_WORKSPACE_CRN' : 'POWERVS_PROD_WORKSPACE_CRN'
+
+                    withCredentials([
+                        string(credentialsId: 'IBM_API_KEY',           variable: 'IBM_API_KEY'),
+                        string(credentialsId: pvsCrnCredId,            variable: 'POWERVS_WORKSPACE_CRN'),
+                        string(credentialsId: cosBucketCredId,         variable: 'COS_BUCKET_NAME'),
+                        string(credentialsId: 'COS_REGION',            variable: 'COS_REGION'),
+                        string(credentialsId: 'COS_HMAC_ACCESS_KEY',   variable: 'COS_HMAC_ACCESS_KEY'),
+                        string(credentialsId: 'COS_HMAC_SECRET_KEY',   variable: 'COS_HMAC_SECRET_KEY')
+                    ]) {
+                        sh '''
+                            cd "${WORK_DIR}"
+                            ./import-to-powervs.sh
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    sh '''
+                        cp /data/centos-images/import.log       import.log       2>/dev/null || true
+                        cp /data/centos-images/image-metadata.json image-metadata.json 2>/dev/null || true
+                    '''
+                    archiveArtifacts(artifacts: 'import.log, image-metadata.json', allowEmptyArchive: true)
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                echo "=== Cleanup work directory ==="
+                sh '''
+                    cd "${WORK_DIR}"
+                    KEEP_METADATA=true KEEP_LOGS=true ./cleanup-resources.sh
+
+                    # Remove stale pvsadm temp dirs and release loop devices
+                    sudo find /tmp -maxdepth 1 -type d -name "qcow2ova*" -exec rm -rf {} + 2>/dev/null || true
+                    sudo losetup -D 2>/dev/null || true
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "=== CentOS Image Automation completed successfully ==="
+            echo "Environment : ${params.ENVIRONMENT}"
+            echo "CentOS vers : ${params.CENTOS_VERSION}"
+        }
+        failure {
+            echo "=== CentOS Image Automation FAILED ==="
+            echo "Check archived logs above for details."
+            echo ""
+            echo "Common causes:"
+            echo "  - Loop device exhaustion       → sudo losetup -D"
+            echo "  - Stale /tmp/qcow2ova dirs     → sudo rm -rf /tmp/qcow2ova*"
+            echo "  - Insufficient disk space      → df -h /data"
+            echo "  - IBM API key missing PowerVS Editor role (needed for image import)"
+            echo "  - Expired IBM API key"
+        }
+        always {
+            pipelineTeardown()
+        }
+    }
+}
